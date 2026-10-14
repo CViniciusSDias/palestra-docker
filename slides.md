@@ -451,8 +451,10 @@ Aqui está uma dica que grandes empresas usam e que poucos conhecem no dia a dia
 # ── Stage 1: Assets de Frontend (Vite) ─────────────────────
 FROM node:20-alpine AS assets
 WORKDIR /app
-COPY package*.json ./ && RUN npm ci --silent
-COPY resources/ vite.config.js ./ && RUN npm run build
+COPY package*.json ./
+RUN npm ci --silent
+COPY resources/ vite.config.js ./
+RUN npm run build
 
 # ── Stage 2: Dependências PHP (Composer + Vendor Shrinking) 
 FROM composer:2.7 AS vendor
@@ -480,10 +482,12 @@ WORKDIR /var/www/html
 COPY --from=mlocati/php-extension-installer /usr/bin/install-php-extensions /usr/local/bin/
 RUN install-php-extensions pdo_mysql redis opcache
 
-# Copia código e artefatos prontos dos estágios anteriores
+# Copia o código da aplicação
+COPY . .
+
+# Copia artefatos prontos gerados nos estágios de build
 COPY --from=vendor /app/vendor/ ./vendor/
 COPY --from=assets /app/public/build/ ./public/build/
-COPY . .
 ```
 
 <!--
@@ -506,49 +510,26 @@ Agora vamos falar de segurança prática em containers: permissões de arquivos,
 
 Por que `RUN chown -R` duplica o tamanho da sua imagem?
 
-- O Docker usa sistemas de arquivos em camadas (**OverlayFS / UnionFS**)
-- Camadas já criadas são **estritamente somente-leitura**
-- O Docker utiliza o mecanismo de **Copy-on-Write (CoW)**:
-  - Para alterar permissões ou dono (`UID/GID`), o arquivo inteiro precisa ser **duplicado** na camada superior
+- Camadas do Docker são **estritamente somente-leitura**
+- Para alterar dono ou permissão, o Docker aplica **Copy-on-Write**:
+  - O arquivo inteiro é **duplicado** na nova camada superior!
+- Se sua aplicação tem 120MB, a imagem salta para **240MB**
+- **A Solução:** definir dono no `COPY` e dar `chown` **apenas** onde há escrita
 
 <!--
-Essa é uma das maiores armadilhas de engenharia com Docker. O dev copia os arquivos da aplicação e depois vê que o www-data não consegue ler ou escrever, então roda um RUN chown -R na pasta inteira. O Docker não consegue mudar metadados de uma camada já gravada no passado. Para mudar a permissão de um arquivo de 10MB, ele precisa copiar esses 10MB inteiros para a nova camada. Se sua aplicação tem 120MB, você acabou de criar uma camada extra de 120MB só para mudar uma flag de permissão.
+Essa é uma das maiores pegadinhas no Docker: o dev copia os arquivos e roda um RUN chown -R na pasta inteira. Como camadas anteriores são somente-leitura, o Docker não altera o arquivo no lugar: ele copia os 120MB inteiros de novo para a nova camada! A solução é usar COPY --chown e rodar chown apenas nas pastas que realmente precisam de escrita em tempo de execução.
 -->
 
 ---
 
-# O Custo do Copy-on-Write
-
-O que acontece no `docker history` da imagem:
-
-<div style="display: flex; justify-content: center;">
-
-| Camada | Instrução no Dockerfile | Tamanho Adicionado |
-|---|---|---|
-| **Camada 3** | `COPY . /var/www/html` | **+120 MB** |
-| **Camada 4** | `RUN chown -R www-data:www-data /var/www/html` | **+120 MB (duplicado!)** |
-
-</div>
-
-> **Resultado:** uma aplicação de 120MB gera uma imagem de **240MB**!
-
-- O tempo de `push` e `pull` no cluster dobra desnecessariamente
-- A camada antiga continua existindo por baixo, consumindo banda e disco
-
-<!--
-Vejam o impacto no docker history: a Camada 3 adicionou 120MB com o código da aplicação. A Camada 4 com o RUN chown adicionou MAIS 120MB! Ou seja, você tem 240MB de dados para transferir pela rede no deploy. A camada antiga não desaparece; ela continua existindo no histórico da imagem, consumindo banda de rede e espaço de disco nos nós do cluster Kubernetes.
--->
-
----
-
-# A Solução: COPY --chown
+# A Solução: Permissões Cirúrgicas
 
 ```dockerfile
-# ❌ INCORRETO: duplica o peso de todos os arquivos no UnionFS
+# ❌ INCORRETO: duplica o peso de todos os arquivos no UnionFS (+120MB)
 COPY . /var/www/html
 RUN chown -R www-data:www-data /var/www/html
 
-# ✅ CORRETO: aplica ownership durante a cópia (CUSTO ZERO de camada)
+# ✅ CORRETO: código pertence a root; chown apenas onde há escrita
 COPY --chown=root:root . .
 COPY --from=vendor --chown=root:root /app/vendor/ ./vendor/
 COPY --from=assets --chown=root:root /app/public/build/ ./public/build/
@@ -559,7 +540,7 @@ RUN chown -R www-data:www-data storage bootstrap/cache && \
 ```
 
 <!--
-Vejam a diferença: usamos a flag nativa --chown diretamente no comando COPY. O arquivo já é gravado na camada pertencendo ao usuário correto. Não existe camada subsequente duplicando nada. E reparem no detalhe de segurança: a maior parte do código pertence a root:root e fica como somente-leitura. Apenas as pastas que realmente precisam de escrita em tempo de execução, como storage e bootstrap/cache, recebem chown para www-data.
+Vejam a diferença no código: o código-fonte entra como root:root direto no COPY com custo zero de camada extra. E o comando RUN chown é executado estritamente sobre as pastas storage e bootstrap/cache, que têm poucos kilobytes, garantindo zero duplicação desnecessária e máxima segurança.
 -->
 
 ---
